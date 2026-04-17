@@ -881,11 +881,41 @@ def contiguous(data: TensorDict) -> TensorDict:
 
 
 def maybe_fix_3d_position_ids(data: TensorDict):
-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
-    if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+    """Fix _ragged_idx for 3D nested position_ids corrupted by TensorDict consolidate+pickle.
+
+    After consolidate + pickle/unpickle (e.g. Ray transfer), 3D jagged NestedTensors
+    (mRoPE position_ids [B, D, L]) get _ragged_idx reset to 1. We detect whether offsets
+    are along the last dim (just restore _ragged_idx=2) or along dim 0 for equal-length
+    cases (rebuild the nested tensor with last-dim offsets).
+    """
+    if "position_ids" not in data.keys():
+        return
+    pos = data["position_ids"]
+    if not (pos.is_nested and pos.dim() == 3):
+        return
+
+    values = pos.values()
+    offsets = pos.offsets()
+
+    if offsets[-1].item() == values.shape[-1]:
+        # Offsets already along last dim — just restore _ragged_idx
+        pos._ragged_idx = 2
+    else:
+        # Equal-length optimization: offsets along dim 0 — rebuild with last-dim offsets
+        batch_size = offsets.shape[0] - 1
+        D = values.shape[0] // batch_size
+        seq_len_per_sample = values.shape[-1]
+        new_offsets = torch.arange(
+            0,
+            (batch_size + 1) * seq_len_per_sample,
+            seq_len_per_sample,
+            dtype=torch.int64,
+            device=values.device,
+        )
+        new_values = values.reshape(batch_size, D, seq_len_per_sample)
+        new_values = torch.cat(list(new_values), dim=-1)  # [D, total_L]
+        new_nt = torch.nested.nested_tensor_from_jagged(new_values, offsets=new_offsets, jagged_dim=2)
+        data["position_ids"] = new_nt
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:
